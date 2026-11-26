@@ -133,7 +133,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 # آیدی عددی ادمین‌های ربات (اجباری، چند ادمین پشتیبانی می‌شود)
-ADMIN_IDS = {8296865861, 8515862438, 8977934490}
+ADMIN_IDS = {8296865861, 7338633340, }
 
 # کاربری فقط وقتی «ممبرِ جذب‌شده از ربات» حساب می‌شود که در همین بازه از زمان هشدار، عضو شود
 ATTRIBUTION_WINDOW_HOURS = 24
