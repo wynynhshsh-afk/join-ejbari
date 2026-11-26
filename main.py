@@ -90,7 +90,7 @@ import io
 import logging
 import os
 import re
-import secrets
+import signal
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -133,7 +133,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 # آیدی عددی ادمین‌های ربات (اجباری، چند ادمین پشتیبانی می‌شود)
-ADMIN_IDS = {8296865861, 7338633340, }
+ADMIN_IDS = {8296865861, 7338633340}
 
 # کاربری فقط وقتی «ممبرِ جذب‌شده از ربات» حساب می‌شود که در همین بازه از زمان هشدار، عضو شود
 ATTRIBUTION_WINDOW_HOURS = 24
@@ -161,7 +161,7 @@ logger = logging.getLogger("forcejoin_bot")
 # مهم: تمام تماس‌های supabase-py «سینک/بلاک‌کننده» هستند (روی httpx sync ساخته شده‌اند).
 # اگر این توابع مستقیم داخل هندلرهای async صدا زده شوند، هر تماس دیتابیس کل
 # event loop تک‌رشته‌ای aiohttp/PTB را برای مدت تایم‌اوت (یا حتی بی‌نهایت،
-# اگر شبکه هنگ کند) فریز می‌کند. در حالت وبهوک یعنی هیچ آپدیت دیگری از تلگرام
+# اگر شبکه هنگ کند) فریز می‌کند. در حالت polling یعنی هیچ آپدیت دیگری از تلگرام
 # پردازش نمی‌شود؛ از بیرون دقیقاً همین‌طور دیده می‌شود: «Render روشن است ولی
 # ربات جواب نمی‌دهد». برای همین:
 #   ۱) روی کلاینت supabase یک تایم‌اوت صریح و معقول ست شده (به‌جای رفتار پیش‌فرض نامشخص).
@@ -2293,77 +2293,38 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# اجرای ربات (Webhook روی aiohttp)
+# اجرای ربات (Long Polling)
 # ---------------------------------------------------------------------------
 
-# مسیر مخفی وبهوک؛ اگر در env ست نشود، یک مقدار تصادفی ثابتِ فرآیند ساخته می‌شود
-# (بهتر است WEBHOOK_SECRET را در Render ست کنید تا بین دیپلوی‌ها ثابت بماند).
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET") or secrets.token_urlsafe(24)
-WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-
-# Render این مقدار را خودش و به‌صورت خودکار در env ست می‌کند.
-BASE_URL = (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEBHOOK_URL", "")).rstrip("/")
+# یک وب‌سرور سبک فقط برای health-check (Render روی سرویس نوع web نیاز به پورت باز دارد
+# و می‌توان آن را با UptimeRobot هم پینگ کرد). هیچ مسیری برای تلگرام ندارد.
 
 
 async def _health(_request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
 
-async def _telegram_webhook(request: web.Request) -> web.Response:
-    application: Application = request.app["application"]
-
-    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if secret_header != WEBHOOK_SECRET:
-        return web.Response(status=403, text="forbidden")
-
-    try:
-        data = await request.json()
-    except Exception:
-        return web.Response(status=400, text="bad request")
-
-    update = Update.de_json(data, application.bot)
-    if update:
-        await application.update_queue.put(update)
-    return web.Response(text="OK")
+async def _start_health_server(port: int) -> web.AppRunner:
+    web_app = web.Application()
+    web_app.router.add_get("/", _health)
+    web_app.router.add_get("/healthz", _health)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    return runner
 
 
-async def _on_startup(app: web.Application) -> None:
-    global _quota_bot
-    application: Application = app["application"]
-    await application.initialize()
-    await application.start()
-    _quota_bot = application.bot
-
-    webhook_url = f"{BASE_URL}{WEBHOOK_PATH}"
-    await application.bot.set_webhook(
-        url=webhook_url,
-        secret_token=WEBHOOK_SECRET,
-        allowed_updates=Update.ALL_TYPES,
-        max_connections=100,
-        drop_pending_updates=False,
-    )
-    logger.info("وبهوک روی %s تنظیم شد", webhook_url)
-
-
-async def _on_cleanup(app: web.Application) -> None:
-    application: Application = app["application"]
-    await application.bot.delete_webhook()
-    await application.stop()
-    await application.shutdown()
-
-
-def main() -> None:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError("متغیرهای محیطی SUPABASE_URL و SUPABASE_KEY باید تنظیم شوند.")
-    if not BASE_URL:
-        raise RuntimeError(
-            "آدرس عمومی سرویس پیدا نشد. اگر روی Render نیستید، متغیر محیطی "
-            "WEBHOOK_URL را برابر آدرس عمومی سرویس‌تان (بدون / انتهایی) ست کنید."
-        )
-
+def _build_application() -> Application:
     request = HTTPXRequest(
         connect_timeout=15.0,
         read_timeout=30.0,
+        write_timeout=15.0,
+        pool_timeout=15.0,
+    )
+    # درخواست جداگانه برای getUpdates تا long-poll استخر اتصال درخواست‌های عادی را اشغال نکند
+    get_updates_request = HTTPXRequest(
+        connect_timeout=15.0,
+        read_timeout=35.0,
         write_timeout=15.0,
         pool_timeout=15.0,
     )
@@ -2372,6 +2333,7 @@ def main() -> None:
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .request(request)
+        .get_updates_request(get_updates_request)
         .concurrent_updates(True)  # پردازش موازی پیام‌ها => سرعت بالا، پیامی جا نمی‌ماند
         .build()
     )
@@ -2390,38 +2352,57 @@ def main() -> None:
     application.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.ALL, owner_private_message)
     )
+    return application
 
-    web_app = web.Application()
-    web_app["application"] = application
-    web_app.router.add_get("/", _health)
-    web_app.router.add_get("/healthz", _health)
-    web_app.router.add_post(WEBHOOK_PATH, _telegram_webhook)
-    web_app.on_startup.append(_on_startup)
-    web_app.on_cleanup.append(_on_cleanup)
 
+def main() -> None:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("متغیرهای محیطی SUPABASE_URL و SUPABASE_KEY باید تنظیم شوند.")
+
+    application = _build_application()
     port = int(os.environ.get("PORT", "10000"))
-    logger.info("ربات در حال اجراست (webhook)...")
 
-    async def _run_with_processor() -> None:
-        runner = web.AppRunner(web_app)
-        await runner.setup()  # اینجا _on_startup صدا زده می‌شود: initialize()+start()+set_webhook
-        site = web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
+    async def _run() -> None:
+        global _quota_bot
 
-        # پردازشگر آپدیت‌ها: چون اینجا run_polling استفاده نمی‌شود،
-        # خودمان باید صف update_queue را مصرف کنیم.
-        queue_task = asyncio.create_task(_process_update_queue(application))
+        health_runner = await _start_health_server(port)
+        await application.initialize()
+        await application.start()
+        _quota_bot = application.bot
+
+        # اگر قبلاً وبهوک ست شده باشد، getUpdates با خطای Conflict رد می‌شود؛ پس اول حذفش می‌کنیم
+        await application.bot.delete_webhook(drop_pending_updates=False)
+        await application.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,  # chat_member برای تایید خودکار عضویت لازم است
+            drop_pending_updates=False,
+            poll_interval=0.0,
+            timeout=30,
+        )
         background_task = asyncio.create_task(_background_loop(application))
         background_task.add_done_callback(_log_task_exception)
-        try:
-            while True:
-                await asyncio.sleep(3600)
-        finally:
-            queue_task.cancel()
-            background_task.cancel()
-            await runner.cleanup()  # اینجا _on_cleanup صدا زده می‌شود: delete_webhook()+stop()+shutdown()
+        logger.info("ربات در حال اجراست (polling)...")
 
-    asyncio.run(_run_with_processor())
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except NotImplementedError:  # ویندوز
+                pass
+
+        try:
+            await stop_event.wait()
+        finally:
+            background_task.cancel()
+            await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
+            await health_runner.cleanup()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
 
 
 def _log_task_exception(task: asyncio.Task) -> None:
@@ -2430,29 +2411,6 @@ def _log_task_exception(task: asyncio.Task) -> None:
     exc = task.exception()
     if exc is not None:
         logger.error("خطای پردازش‌نشده در تسک آپدیت: %s", exc, exc_info=exc)
-
-
-async def _process_update_queue(application: Application) -> None:
-    """
-    مصرف‌کننده‌ی صف آپدیت‌ها. حیاتی‌ست که این حلقه هرگز کامل متوقف نشود، وگرنه
-    aiohttp همچنان سالم و 'روشن' جواب می‌دهد ولی هیچ آپدیتی از تلگرام دیگر
-    پردازش نمی‌شود (دقیقاً همان علامتی که گزارش شده: رندر روشن، ربات ساکت).
-    برای همین هر خطای احتمالی این‌جا catch می‌شود تا خودِ حلقه هیچ‌وقت نمیرد.
-    """
-    while True:
-        try:
-            update = await application.update_queue.get()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.error("خطا در دریافت از صف آپدیت: %s", exc, exc_info=exc)
-            continue
-
-        try:
-            task = application.create_task(application.process_update(update))
-            task.add_done_callback(_log_task_exception)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("خطا در ایجاد تسک پردازش آپدیت: %s", exc, exc_info=exc)
 
 
 if __name__ == "__main__":
