@@ -1,0 +1,331 @@
+"""
+پنل جدید مدیریت (Reply Keyboard) + مسیریاب پیام‌های خصوصی + ثبت هندلرها.
+
+- ادمین‌ها با /start یک پنل reply keyboard می‌گیرند.
+- کاربران عادی (وقتی فروش جوین اجباری روشن است) وارد جریان خرید می‌شوند (sales.py).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import html
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from telegram import (
+    Chat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ChatMemberStatus, ParseMode
+from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ChatMemberHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+import bot as core
+import sales
+
+logger = logging.getLogger("forcejoin_bot.panel")
+
+BTN_ITEMS = "📦 مدیریت آیتم‌ها"
+BTN_SETTINGS = "⚙️ تنظیمات"
+BTN_GROUP = "🏠 تنظیم گروه"
+BTN_AVG = "📈 میانگین جذب"
+BTN_STATUS = "ℹ️ وضعیت فعلی"
+
+
+def admin_panel_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(BTN_ITEMS, style="primary"), KeyboardButton(BTN_SETTINGS, style="primary")],
+            [KeyboardButton(BTN_GROUP, style="primary"), KeyboardButton(BTN_AVG, style="success")],
+            [KeyboardButton(BTN_STATUS, style="success")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="یکی از گزینه‌های پنل را انتخاب کنید",
+    )
+
+
+def settings_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✏️ ویرایش متن‌ها", callback_data="st_texts", style="primary")],
+            [InlineKeyboardButton("⏱ زمان حذف هشدار پیام", callback_data="st_timer", style="primary")],
+            [InlineKeyboardButton("💰 فعال‌سازی فروش جوین اجباری خودکار", callback_data="sale_open", style="success")],
+            [InlineKeyboardButton("🔙 بستن", callback_data="menu_main")],
+        ]
+    )
+
+
+def clear_admin_pending(user_id: int) -> None:
+    """هر حالت «منتظر ورودی» قبلی ادمین را لغو می‌کند (وقتی دکمه‌ی پنل را می‌زند)."""
+    core.PENDING_TEXT_EDIT.pop(user_id, None)
+    core.PENDING_ITEM_ADD.discard(user_id)
+    core.PENDING_BOT_ADD.discard(user_id)
+    core.PENDING_LINK_EDIT.pop(user_id, None)
+    core.PENDING_ITEM_TIME.pop(user_id, None)
+    core.PENDING_ITEM_QUOTA.pop(user_id, None)
+    core.PENDING_GROUP_SET.discard(user_id)
+    core.PENDING_DELETE_TIMER_SET.discard(user_id)
+    sales.clear_admin_state(user_id)
+
+
+# ---------------------------------------------------------------------------
+# /start و مسیریاب پیوی
+# ---------------------------------------------------------------------------
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != Chat.PRIVATE:
+        return
+    user = update.effective_user
+    if user is not None and context.bot.username:
+        await core.record_bot_start(context.bot.username, user.id)
+
+    if not core.is_admin(user.id):
+        await sales.buyer_start(update, context)
+        return
+
+    clear_admin_pending(user.id)
+    await update.message.reply_text(
+        "به پنل مدیریت ربات جوین اجباری خوش آمدید 👋",
+        reply_markup=admin_panel_kb(),
+    )
+
+
+async def on_items(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text("مدیریت آیتم‌های جوین اجباری:", reply_markup=core.CHANNELS_MENU)
+
+
+async def on_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text("⚙️ تنظیمات:", reply_markup=settings_kb())
+
+
+GROUP_PROMPT = (
+    "🏠 <b>تنظیم گروه</b>\n\n"
+    "ابتدا ربات را در گروه <b>ادمین</b> کنید، سپس یکی از این‌ها را بفرستید:\n"
+    "• یوزرنیم: <code>@USERNAME</code>\n"
+    "• لینک گروه: <code>https://t.me/USERNAME</code>\n"
+    "• لینک یک پیام گروه: <code>https://t.me/c/1234567890/5</code>\n"
+    "• آیدی عددی: <code>-1001234567890</code>\n"
+    "• فوروارد یک پیام از گروه\n\n"
+    "اگر گروه خصوصی است و فقط لینک دعوت (+…) دارید، داخل خود گروه دستور <code>/setgroup</code> را بفرستید."
+)
+
+
+async def on_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    core.PENDING_GROUP_SET.add(update.effective_user.id)
+    await update.effective_message.reply_text(GROUP_PROMPT, parse_mode=ParseMode.HTML)
+
+
+async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """داخل گروه: ادمین ربات با /setgroup همان گروه را به‌عنوان گروه اصلی ثبت می‌کند (برای گروه‌های خصوصی)."""
+    chat = update.effective_chat
+    user = update.effective_user
+    message = update.effective_message
+    if chat.type not in (Chat.GROUP, Chat.SUPERGROUP) or user is None or not core.is_admin(user.id):
+        return
+    try:
+        me = await context.bot.get_chat_member(chat.id, context.bot.id)
+    except (BadRequest, Forbidden, TimedOut, NetworkError) as exc:
+        await message.reply_text(f"خطا در دسترسی به گروه: {exc}")
+        return
+    if me.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+        await message.reply_text("اول ربات را در این گروه ادمین کنید، بعد دوباره /setgroup بفرستید.")
+        return
+    err = await core.set_group_id(chat.id)
+    if err:
+        await message.reply_text(f"❌ ذخیره در دیتابیس شکست خورد:\n{err[:200]}")
+        return
+    await message.reply_text("این گروه به‌عنوان گروه اصلی ثبت شد ✅")
+
+
+# ---------------------------------------------------------------------------
+# میانگین جذب
+# ---------------------------------------------------------------------------
+
+
+def _fmt_num(value: float) -> str:
+    return f"{value:,.1f}" if abs(value - round(value)) > 0.05 else f"{int(round(value)):,}"
+
+
+async def build_avg_text(bot) -> str:
+    items = await core.list_all_items()
+    now = datetime.now(timezone.utc)
+
+    def _query():
+        sb = core.supabase
+
+        def count(since: Optional[str] = None) -> int:
+            q = sb.table("join_attributions").select("user_id", count="exact").not_.is_("joined_at", "null")
+            if since:
+                q = q.gte("joined_at", since)
+            return q.limit(1).execute().count or 0
+
+        total = count()
+        last_24h = count((now - timedelta(hours=24)).isoformat())
+        last_7d = count((now - timedelta(days=7)).isoformat())
+        first = (
+            sb.table("join_attributions").select("joined_at").not_.is_("joined_at", "null")
+            .order("joined_at").limit(1).execute().data
+        )
+        return total, last_24h, last_7d, (first[0]["joined_at"] if first else None)
+
+    stats = await asyncio.to_thread(core._safe_db, _query, None)
+    counts = await core.fetch_member_counts(bot, items, force=True) if items else {}
+
+    lines = ["📈 <b>میانگین جذب ربات</b>", ""]
+    if items:
+        per_item = [(it, counts.get(it["id"]) or 0) for it in items]
+        total_items = sum(c for _it, c in per_item)
+        active = sum(1 for it in items if not core.item_is_expired(it))
+        best_item, best_count = max(per_item, key=lambda p: p[1])
+        lines.append(f"📦 تعداد آیتم‌ها: {len(items):,} (فعال: {active:,})")
+        lines.append(f"👥 مجموع ورودی‌ها: {total_items:,}")
+        lines.append(f"📊 میانگین ورودی هر آیتم: <b>{_fmt_num(total_items / len(items))}</b>")
+        if best_count > 0:
+            lines.append(f"🏆 بهترین آیتم: {html.escape(best_item['title'])} ({best_count:,})")
+    else:
+        lines.append("هنوز هیچ آیتمی ثبت نشده است.")
+
+    lines.append("")
+    if stats is None:
+        lines.append("⚠️ خواندن آمار زمانی از دیتابیس ممکن نشد.")
+    else:
+        total, last_24h, last_7d, first_ts = stats
+        first = core._parse_ts(first_ts)
+        lines.append(f"✅ کل ممبر جذب‌شده از طریق ربات (از ابتدا): {total:,}")
+        if first is not None and total:
+            days_active = max((now - first).total_seconds() / 86400, 1.0)
+            lines.append(f"📅 میانگین روزانه (از ابتدا): <b>{_fmt_num(total / days_active)}</b>")
+            window = min(days_active, 7.0)
+            lines.append(f"📅 میانگین روزانه (۷ روز اخیر): <b>{_fmt_num(last_7d / window)}</b>")
+        else:
+            lines.append("📅 میانگین روزانه: 0")
+        lines.append(f"🕐 میانگین ساعتی (۲۴ ساعت اخیر): <b>{_fmt_num(last_24h / 24)}</b>")
+        lines.append(f"🆕 جذب‌شده در ۲۴ ساعت اخیر: {last_24h:,}")
+    return "\n".join(lines)
+
+
+async def on_avg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = await build_avg_text(context.bot)
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# ---------------------------------------------------------------------------
+# وضعیت فعلی
+# ---------------------------------------------------------------------------
+
+
+async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    group_id = await core.get_group_id()
+    items = await core.list_items()
+    delete_seconds = await core.get_warn_delete_seconds()
+    text = (
+        f"گروه فعال: <code>{group_id if group_id else 'تنظیم نشده'}</code>\n"
+        f"تعداد آیتم‌ها: {len(items)}\n"
+        f"زمان حذف پیام هشدار: {delete_seconds:g} ثانیه\n"
+        f"💰 فروش جوین اجباری: {'🟢 روشن' if sales.sale_enabled() else '🔴 خاموش'}"
+    )
+    if sales.sale_enabled():
+        open_count = sum(1 for r in sales.RES.values() if r["status"] in sales.OPEN_STATUSES)
+        text += f"\nرزروهای باز: {open_count} | لاین روزانه: {sales.CFG['lanes']}"
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+ACTIONS = {
+    BTN_ITEMS: on_items,
+    BTN_SETTINGS: on_settings,
+    BTN_GROUP: on_group,
+    BTN_AVG: on_avg,
+    BTN_STATUS: on_status,
+}
+
+
+async def private_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None or update.effective_chat.type != Chat.PRIVATE:
+        return
+
+    if not core.is_admin(user.id):
+        await sales.buyer_message(update, context)
+        return
+
+    action = ACTIONS.get((message.text or "").strip())
+    if action is not None:
+        clear_admin_pending(user.id)
+        await action(update, context)
+        return
+
+    if await sales.admin_sale_message(update, context):
+        return
+    await core.owner_private_message(update, context)
+
+
+# ---------------------------------------------------------------------------
+# منوی تنظیمات (inline)
+# ---------------------------------------------------------------------------
+
+
+async def st_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    if not core.is_admin(user_id):
+        await query.answer("شما ادمین ربات نیستید.", show_alert=True)
+        return
+    await query.answer()
+    data = query.data
+    clear_admin_pending(user_id)
+
+    if data == "st_main":
+        await query.edit_message_text("⚙️ تنظیمات:", reply_markup=settings_kb())
+    elif data == "st_texts":
+        await query.edit_message_text("ویرایش متن‌ها:", reply_markup=core.TEXTS_MENU)
+    elif data == "st_timer":
+        core.PENDING_DELETE_TIMER_SET.add(user_id)
+        current = await core.get_warn_delete_seconds()
+        await query.edit_message_text(
+            f"زمان فعلی حذف خودکار پیام هشدار جوین اجباری: <b>{current:g} ثانیه</b>\n\n"
+            "عدد جدید (ثانیه) را ارسال کنید، مثلاً <code>5</code> یا <code>10</code>.\n"
+            "برای غیرفعال‌کردن حذف خودکار، عدد <code>0</code> را ارسال کنید.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=core.back_kb("st_main"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# ثبت هندلرها
+# ---------------------------------------------------------------------------
+
+
+def register(application: Application) -> None:
+    add = application.add_handler
+    add(CommandHandler("start", start_cmd))
+    add(CommandHandler("setgroup", cmd_setgroup, filters=filters.ChatType.GROUPS))
+    add(ChatMemberHandler(core.on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
+    add(ChatMemberHandler(sales.on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    add(CallbackQueryHandler(core.on_check_membership, pattern=r"^check_membership(_\d+)?$"))
+    add(CallbackQueryHandler(sales.sale_callback, pattern=r"^sale_"))
+    add(CallbackQueryHandler(st_callback, pattern=r"^st_"))
+    add(CallbackQueryHandler(core.owner_panel_router, pattern="^(menu_|ch_|txt_)"))
+
+    add(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, core.on_group_message))
+    add(MessageHandler(filters.ChatType.PRIVATE & filters.ALL, private_router))
+
+    core.STARTUP_HOOKS.append(sales.on_startup)
+    core.SHUTDOWN_HOOKS.append(sales.on_shutdown)
+    core.BACKGROUND_HOOKS.append(sales.sweep)
