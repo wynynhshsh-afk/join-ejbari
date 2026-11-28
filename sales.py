@@ -75,6 +75,10 @@ BTN_BUY = "🛒 خرید جوین"
 BTN_MY = "📋 رزروهای من"
 BTN_BACK = "🔙 بازگشت"
 BTN_CANCEL = "❌ انصراف از رزرو"
+BTN_TYPE_CHAT = "📢 کانال / گروه"
+BTN_TYPE_BOT = "🤖 ربات"
+TYPE_LABEL = {"chat": "📢 کانال/گروه", "bot": "🤖 ربات"}
+SKIP_WORDS = {"-", "—", "–", "0", "ندارم", "خیر", "هیچ"}
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -193,7 +197,7 @@ RES: dict = {}      # reservation_id -> row (دقیقاً ستون‌های sale
 PAY: dict = {}      # payment_id -> row (دقیقاً ستون‌های sale_payments)
 USERS: dict = {}    # user_id -> row (دقیقاً ستون‌های sale_users)
 
-CFG: dict = {"enabled": False, "tariffs": [], "card_number": "", "card_name": "", "lanes": 0}
+CFG: dict = {"enabled": False, "tariffs": [], "bot_tariffs": [], "card_number": "", "card_name": "", "lanes": 0}
 
 TABLE_PK = {"sale_reservations": "id", "sale_payments": "id", "sale_users": "user_id"}
 _DIRTY: dict = {}
@@ -312,20 +316,24 @@ async def schema_error() -> Optional[str]:
 
 
 async def load_config() -> None:
-    enabled, tariffs, card, lanes = await asyncio.gather(
+    enabled, tariffs, bot_tariffs, card, lanes = await asyncio.gather(
         core.get_setting("sale_enabled"),
         core.get_setting("sale_tariffs"),
+        core.get_setting("sale_bot_tariffs"),
         core.get_setting("sale_card"),
         core.get_setting("sale_lanes"),
     )
     CFG["enabled"] = enabled == "1"
-    try:
-        parsed = json.loads(tariffs) if tariffs else []
-        CFG["tariffs"] = [
-            {"hours": int(t["hours"]), "price": int(t["price"])} for t in parsed if int(t["hours"]) > 0
-        ]
-    except (ValueError, TypeError, KeyError):
-        CFG["tariffs"] = []
+
+    def _tariffs(raw) -> list:
+        try:
+            parsed = json.loads(raw) if raw else []
+            return [{"hours": int(t["hours"]), "price": int(t["price"])} for t in parsed if int(t["hours"]) > 0]
+        except (ValueError, TypeError, KeyError):
+            return []
+
+    CFG["tariffs"] = _tariffs(tariffs)
+    CFG["bot_tariffs"] = _tariffs(bot_tariffs)
     try:
         card_obj = json.loads(card) if card else {}
         CFG["card_number"] = str(card_obj.get("number", ""))
@@ -342,6 +350,7 @@ async def persist_config(*keys: str) -> list:
     values = {
         "enabled": ("sale_enabled", "1" if CFG["enabled"] else "0"),
         "tariffs": ("sale_tariffs", json.dumps(CFG["tariffs"], ensure_ascii=False)),
+        "bot_tariffs": ("sale_bot_tariffs", json.dumps(CFG["bot_tariffs"], ensure_ascii=False)),
         "card": ("sale_card", json.dumps({"number": CFG["card_number"], "name": CFG["card_name"]}, ensure_ascii=False)),
         "lanes": ("sale_lanes", str(CFG["lanes"])),
     }
@@ -359,11 +368,28 @@ def sale_enabled() -> bool:
 
 
 def sale_ready() -> bool:
-    return bool(CFG["enabled"] and CFG["tariffs"] and CFG["card_number"] and CFG["card_name"] and CFG["lanes"] > 0)
+    return bool(CFG["enabled"] and config_complete())
 
 
 def config_complete() -> bool:
-    return bool(CFG["tariffs"] and CFG["card_number"] and CFG["card_name"] and CFG["lanes"] > 0)
+    return bool((CFG["tariffs"] or CFG["bot_tariffs"]) and CFG["card_number"] and CFG["card_name"] and CFG["lanes"] > 0)
+
+
+def tariffs_for(kind: str) -> list:
+    return CFG["bot_tariffs"] if kind == "bot" else CFG["tariffs"]
+
+
+def available_kinds() -> list:
+    kinds = []
+    if CFG["tariffs"]:
+        kinds.append("chat")
+    if CFG["bot_tariffs"]:
+        kinds.append("bot")
+    return kinds
+
+
+def res_kind(res: dict) -> str:
+    return "bot" if res.get("chat_kind") == "bot" else "chat"
 
 
 # ---------------------------------------------------------------------------
@@ -498,31 +524,54 @@ def _holds_lane(res: dict, now: datetime) -> bool:
     return True
 
 
-def usage_by_day(now: Optional[datetime] = None) -> dict:
-    now = now or utcnow()
-    usage: dict = {}
+def _res_interval(res: dict) -> tuple:
+    start = day_start_utc(res["day"])
+    end = start + timedelta(hours=res["hours"])
+    if res.get("status") in ("active", "finished"):
+        actual = core._parse_ts(res.get("expires_at"))
+        if actual is not None and actual > end:
+            end = actual
+    return start, end
+
+
+def usage_for_day(day_iso: str, now: datetime, items: Optional[list]) -> int:
+    """
+    تعداد لاین‌های اشغال‌شده‌ی یک روز (به وقت تهران) = فروش‌های خودکاری که آن روز در جوین اجباری هستند
+    + آیتم‌هایی که ادمین دستی ثبت کرده و آن روز فعال‌اند. آیتم‌های دستی همیشه قابل افزودن‌اند؛
+    فقط ظرفیتِ فروش خودکار را کم می‌کنند.
+    """
+    d0 = day_start_utc(day_iso)
+    d1 = d0 + timedelta(days=1)
+    sold_item_ids = {r["item_id"] for r in RES.values() if r.get("item_id")}
+    used = 0
     for res in RES.values():
         if _holds_lane(res, now):
-            usage[res["day"]] = usage.get(res["day"], 0) + 1
-    return usage
+            start, end = _res_interval(res)
+            if start < d1 and end > d0:
+                used += 1
+    for item in items or []:
+        if item.get("id") in sold_item_ids or item.get("quota_done"):
+            continue
+        expires = core._parse_ts(item.get("expires_at"))
+        if expires is None or expires > d0:
+            used += 1
+    return used
 
 
-def build_days(now: Optional[datetime] = None) -> list:
+def build_days(now: datetime, items: Optional[list]) -> list:
     """[(date, iso, is_full)] برای امروز تا DAYS_AHEAD روز آینده."""
-    now = now or utcnow()
     today = tehran_today(now)
-    usage = usage_by_day(now)
     lanes = CFG["lanes"]
     days = []
     for i in range(DAYS_AHEAD):
         d = today + timedelta(days=i)
         key = d.isoformat()
-        days.append((d, key, usage.get(key, 0) >= lanes))
+        days.append((d, key, usage_for_day(key, now, items) >= lanes))
     return days
 
 
-def day_is_full(day_iso: str, now: Optional[datetime] = None) -> bool:
-    return usage_by_day(now).get(day_iso, 0) >= CFG["lanes"]
+def day_is_full(day_iso: str, now: datetime, items: Optional[list]) -> bool:
+    return usage_for_day(day_iso, now, items) >= CFG["lanes"]
 
 
 def open_hold(user_id: int, now: Optional[datetime] = None) -> Optional[dict]:
@@ -533,19 +582,20 @@ def open_hold(user_id: int, now: Optional[datetime] = None) -> Optional[dict]:
     return None
 
 
-def find_unbound(user_id: int) -> Optional[dict]:
+def find_unbound(user_id: int, kind: str = "chat") -> Optional[dict]:
     rows = [
         r for r in RES.values()
         if r["user_id"] == user_id and not r.get("chat_id") and r["status"] in UNBOUND_OK_STATUSES
+        and res_kind(r) == kind
     ]
     rows.sort(key=lambda r: (r.get("created_at") or "", r["id"]))
     return rows[0] if rows else None
 
 
-def create_reservation(user_id: int, day_iso: str, tariff: dict) -> Optional[dict]:
+def create_reservation(user_id: int, day_iso: str, tariff: dict, kind: str, items: Optional[list]) -> Optional[dict]:
     """بررسی ظرفیت و ثبت رزرو بدون هیچ await بین این دو؛ در نتیجه دو خریدار هم‌زمان یک لاین را نمی‌گیرند."""
     now = utcnow()
-    if day_is_full(day_iso, now):
+    if day_is_full(day_iso, now, items):
         return None
     res = {
         "id": new_id(),
@@ -555,7 +605,7 @@ def create_reservation(user_id: int, day_iso: str, tariff: dict) -> Optional[dic
         "amount": int(tariff["price"]),
         "status": "awaiting_payment",
         "chat_id": None,
-        "chat_kind": None,
+        "chat_kind": "bot" if kind == "bot" else None,
         "chat_title": None,
         "item_id": None,
         "payment_id": None,
@@ -642,17 +692,18 @@ async def group_display(bot) -> str:
 
 def guide_steps(bot_username: str) -> list:
     example = "12 ساعته مبلغ 250000"
-    if CFG["tariffs"]:
-        t = CFG["tariffs"][0]
+    kinds = available_kinds()
+    if kinds:
+        t = tariffs_for(kinds[0])[0]
         example = f"{t['hours']} ساعته مبلغ {t['price']}"
     return [
-        "روی دکمه «خرید جوین» بزنید و یک روز خالی را رزرو کنید (روزهای خالی به رنگ سبز 🟢 و روزهای رزرو شده به رنگ قرمز 🔴 هستند).",
+        "روی دکمه «خرید جوین» بزنید، نوع (کانال/گروه یا ربات) را مشخص کنید و یک روز خالی را رزرو کنید (روزهای خالی به رنگ سبز 🟢 و روزهای رزرو شده به رنگ قرمز 🔴 هستند).",
         f"سپس تایم ماندگاری رزرو را انتخاب کنید (مثال: {example}).",
         "سپس مبلغ را پرداخت کنید و فیش پرداخت را برای ربات ارسال کنید.",
-        f"ربات @{bot_username} را با استفاده از دکمه «افزودن به گروه» ادمین گروهتان کنید.",
-        "سپس ربات به صورت خودکار گروه شما را تشخیص می‌دهد و شما را وارد رزروها می‌کند.",
+        f"اگر کانال یا گروه دارید، ربات @{bot_username} را با دکمه «افزودن به گروه/کانال» ادمین کنید. اگر ربات دارید، یوزرنیم ربات را برای من بفرستید.",
+        "سپس ربات به صورت خودکار گروه/کانال/ربات شما را تشخیص می‌دهد و شما را وارد رزروها می‌کند.",
         "پس از تایید فیش توسط مالک گروه، شما آماده می‌شوید تا روز جوین اجباری و به صورت خودکار وارد لیست می‌شوید.",
-        "پس از پایان جوین، ربات به صورت خودکار عکس قبل و بعد گروه شما را برایتان می‌فرستد.",
+        "پس از پایان جوین، ربات به صورت خودکار عکس قبل و بعد را برایتان می‌فرستد.",
     ]
 
 
@@ -670,16 +721,20 @@ async def welcome_text(bot, user: User) -> str:
 def payment_text(res: dict) -> str:
     hold = core._parse_ts(res.get("hold_expires_at"))
     minutes = int(PAYMENT_HOLD.total_seconds() // 60)
+    kind = res_kind(res)
     text = (
         "✅ <b>رزرو شما ثبت شد</b>\n\n"
+        f"🏷 نوع: {TYPE_LABEL[kind]}\n"
         f"📅 روز: {fa_day_full(res['day'])}\n"
         f"⏱ مدت: {fmt_hours(res['hours'])}\n"
         f"💰 مبلغ: <b>{fmt_money(res['amount'])}</b>\n\n"
         f"💳 شماره کارت:\n<code>{fmt_card(CFG['card_number'])}</code>\n"
         f"👤 به نام: <b>{e(CFG['card_name'])}</b>\n\n"
         "پس از پرداخت، <b>تصویر فیش</b> (یا کد پیگیری) را همین‌جا ارسال کنید.\n"
-        f"⏳ این رزرو تا {to_fa(minutes)} دقیقه برای شما نگه داشته می‌شود"
     )
+    if kind == "bot" and not res.get("chat_id"):
+        text += "🤖 همچنین <b>یوزرنیم ربات</b> خود را بفرستید (مثال: <code>@MyBot</code>).\n"
+    text += f"⏳ این رزرو تا {to_fa(minutes)} دقیقه برای شما نگه داشته می‌شود"
     if hold:
         text += f" (تا ساعت {to_fa(hold.astimezone(TEHRAN_TZ).strftime('%H:%M'))})"
     return text + "."
@@ -713,10 +768,11 @@ async def _show_menu(update: Update, text: str = "یکی از گزینه‌ها 
     await reply(update, text, reply_markup=buyer_menu_kb())
 
 
-async def _show_days(update: Update) -> None:
+async def _show_days(update: Update, kind: str) -> None:
     user_id = update.effective_user.id
     now = utcnow()
-    days = build_days(now)
+    items = await core.list_all_items()
+    days = build_days(now, items)
     today = tehran_today(now)
     if all(full for _d, _k, full in days):
         await _show_menu(update, "😔 فعلاً همه‌ی روزها پر شده‌اند. بعداً دوباره سر بزنید.")
@@ -729,26 +785,42 @@ async def _show_days(update: Update) -> None:
         buttons.append(_btn(label, "danger" if full else "success"))
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     rows.append([_btn(BTN_BACK)])
-    BUYER[user_id] = {"step": "days", "days": labels}
+    BUYER[user_id] = {"step": "days", "type": kind, "days": labels}
     await reply(
         update,
-        "📅 <b>یک روز خالی را انتخاب کنید</b>\n🟢 خالی  |  🔴 پر",
+        f"{TYPE_LABEL[kind]}\n📅 <b>یک روز خالی را انتخاب کنید</b>\n🟢 خالی  |  🔴 پر",
         reply_markup=_kb(rows, "روز مورد نظر را انتخاب کنید"),
     )
 
 
-async def _show_tariffs(update: Update, day_iso: str) -> None:
+async def _show_types(update: Update) -> None:
+    kinds = available_kinds()
+    if len(kinds) == 1:
+        await _show_days(update, kinds[0])
+        return
+    BUYER[update.effective_user.id] = {"step": "type"}
+    await reply(
+        update,
+        "🏷 <b>چه چیزی را می‌خواهید در جوین اجباری قرار دهید؟</b>",
+        reply_markup=_kb(
+            [[_btn(BTN_TYPE_CHAT, "primary"), _btn(BTN_TYPE_BOT, "primary")], [_btn(BTN_BACK)]],
+            "نوع را انتخاب کنید",
+        ),
+    )
+
+
+async def _show_tariffs(update: Update, day_iso: str, kind: str) -> None:
     labels: dict = {}
     rows = []
-    for idx, t in enumerate(CFG["tariffs"]):
+    for idx, t in enumerate(tariffs_for(kind)):
         label = tariff_label(t)
         labels[label] = idx
         rows.append([_btn(label, "primary")])
     rows.append([_btn(BTN_BACK)])
-    BUYER[update.effective_user.id] = {"step": "tariffs", "day": day_iso, "tariffs": labels}
+    BUYER[update.effective_user.id] = {"step": "tariffs", "type": kind, "day": day_iso, "tariffs": labels}
     await reply(
         update,
-        f"📅 روز انتخابی: <b>{fa_day_full(day_iso)}</b>\n\n⏱ <b>مدت ماندگاری جوین اجباری را انتخاب کنید:</b>",
+        f"{TYPE_LABEL[kind]}\n📅 روز انتخابی: <b>{fa_day_full(day_iso)}</b>\n\n⏱ <b>مدت ماندگاری جوین اجباری را انتخاب کنید:</b>",
         reply_markup=_kb(rows, "مدت را انتخاب کنید"),
     )
 
@@ -770,32 +842,37 @@ async def _start_buy(update: Update) -> None:
     if hold is not None:
         await _show_payment(update, hold)  # رزروِ منتظر پرداخت دارد؛ ادامه‌ی همان
         return
-    await _show_days(update)
+    await _show_types(update)
 
 
 async def _pick_day(update: Update, state: dict, text: str) -> None:
+    kind = state.get("type", "chat")
     entry = state.get("days", {}).get(text)
     if entry is None:
-        await _show_days(update)
+        await _show_days(update, kind)
         return
     day_iso, _was_full = entry
-    if day_is_full(day_iso):
+    items = await core.list_all_items()
+    if day_is_full(day_iso, utcnow(), items):
         await reply(update, "🔴 این روز پر شده است. روز دیگری را انتخاب کنید.")
-        await _show_days(update)
+        await _show_days(update, kind)
         return
-    await _show_tariffs(update, day_iso)
+    await _show_tariffs(update, day_iso, kind)
 
 
 async def _pick_tariff(update: Update, state: dict, text: str) -> None:
+    kind = state.get("type", "chat")
+    tariffs = tariffs_for(kind)
     idx = state.get("tariffs", {}).get(text)
     day_iso = state.get("day")
-    if idx is None or day_iso is None or idx >= len(CFG["tariffs"]):
+    if idx is None or day_iso is None or idx >= len(tariffs):
         await _start_buy(update)
         return
-    res = create_reservation(update.effective_user.id, day_iso, CFG["tariffs"][idx])
+    items = await core.list_all_items()   # await قبل از بررسیِ ظرفیت؛ بررسی و ثبت بعدش پشت‌سرهم و بدون await هستند
+    res = create_reservation(update.effective_user.id, day_iso, tariffs[idx], kind, items)
     if res is None:
-        await reply(update, "🔴 همین الان آخرین لاین این روز رزرو شد. روز دیگری را انتخاب کنید.")
-        await _show_days(update)
+        await reply(update, "🔴 همین الان آخرین لاین این روز پر شد. روز دیگری را انتخاب کنید.")
+        await _show_days(update, kind)
         return
     await _show_payment(update, res)
 
@@ -818,15 +895,58 @@ async def _show_my(update: Update) -> None:
         return
     lines = []
     for r in rows[:10]:
-        line = f"📅 {fa_day_full(r['day'])} — ⏱ {fmt_hours(r['hours'])}\n{STATUS_LABEL.get(r['status'], r['status'])}"
+        kind = res_kind(r)
+        line = (
+            f"{TYPE_LABEL[kind]} — 📅 {fa_day_full(r['day'])} — ⏱ {fmt_hours(r['hours'])}\n"
+            f"{STATUS_LABEL.get(r['status'], r['status'])}"
+        )
         if r["status"] in ("approved", "pending_review", "awaiting_payment") and not r.get("chat_id"):
-            line += "\n⚠️ هنوز ربات به‌عنوان ادمین گروه/کانال شما ثبت نشده است."
+            line += (
+                "\n⚠️ هنوز یوزرنیم ربات شما ثبت نشده است."
+                if kind == "bot"
+                else "\n⚠️ هنوز ربات به‌عنوان ادمین گروه/کانال شما ثبت نشده است."
+            )
         elif r["status"] == "active" and r.get("expires_at"):
             line += f"\n🕓 پایان: {fa_datetime(core._parse_ts(r['expires_at']))}"
         if r.get("chat_title"):
             line += f"\n📌 {e(r['chat_title'])}"
         lines.append(line)
     await _show_menu(update, "📋 <b>رزروهای شما</b>\n\n" + "\n\n".join(lines))
+
+
+_BOT_NAME_RE = re.compile(r"^[A-Za-z0-9_]{2,29}[Bb][Oo][Tt]$")
+
+
+def extract_bot_username(text: str) -> Optional[str]:
+    """از @MyBot ، MyBot یا https://t.me/MyBot?start=... یوزرنیم ربات را درمی‌آورد (نام ربات باید به bot ختم شود)."""
+    t = (text or "").strip()
+    m = re.match(r"^(?:https?://)?(?:t|telegram)\.me/([A-Za-z0-9_]{5,32})(?:/\S*)?(?:\?.*)?$", t, re.IGNORECASE)
+    name = m.group(1) if m else t.lstrip("@")
+    return name if len(name) >= 5 and _BOT_NAME_RE.match(name) else None
+
+
+async def bind_bot_username(bot, res: dict, username: str) -> None:
+    title = username
+    try:
+        info = await bot.get_chat(f"@{username}")
+        title = info.first_name or info.title or username
+    except (BadRequest, Forbidden, TimedOut, NetworkError) as exc:
+        logger.info("گرفتن اطلاعات ربات %s ممکن نشد: %s", username, exc)
+    set_status(res, res["status"], chat_id=username, chat_kind="bot", chat_title=title, bound_at=iso(utcnow()))
+    text = f"✅ ربات «<b>{e(title)}</b>» (@{e(username)}) ثبت شد و به رزرو {fa_day_full(res['day'])} شما متصل شد."
+    if res["status"] == "approved":
+        text += "\nدر روز مقرر به‌صورت خودکار وارد جوین اجباری می‌شود."
+    elif res["status"] == "pending_review":
+        text += "\nپس از تایید فیش توسط مالک، در روز مقرر وارد جوین اجباری می‌شود."
+    else:
+        text += "\nفیش پرداخت را هم ارسال کنید."
+    await safe_send(bot, res["user_id"], text)
+    await notify_admins(
+        bot,
+        f"🔗 ربات @{e(username)} برای رزرو {user_label(res['user_id'])} "
+        f"({fa_day_full(res['day'])}، {fmt_hours(res['hours'])}) ثبت شد.",
+    )
+    await activate_due(bot)
 
 
 _CHAT_REF_RE = re.compile(r"^(@[A-Za-z0-9_]{5,32}|(?:https?://)?(?:t|telegram)\.me/\S+|-100\d{5,})$", re.IGNORECASE)
@@ -860,7 +980,7 @@ async def bind_chat(bot, res: dict, chat_id: int, chat_type: str, title: str, so
 
 async def _try_bind_by_ref(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
     user = update.effective_user
-    res = find_unbound(user.id)
+    res = find_unbound(user.id, "chat")
     if res is None:
         return False
     ref, private_link = core.parse_chat_ref(text)
@@ -942,6 +1062,7 @@ async def _receive_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, r
         "💳 <b>فیش پرداخت جدید</b>\n\n"
         f"👤 خریدار: {mention_html(user)}"
         f"{' (@' + e(user.username) + ')' if user.username else ''} — <code>{user.id}</code>\n"
+        f"🏷 نوع: {TYPE_LABEL[res_kind(res)]}\n"
         f"📅 روز جوین: {fa_day_full(res['day'])}\n"
         f"⏱ مدت: {fmt_hours(res['hours'])}\n"
         f"💰 مبلغ: <b>{fmt_money(res['amount'])}</b>"
@@ -985,7 +1106,10 @@ async def _receive_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, r
 
     BUYER[user.id] = {"step": "menu"}
     text = "✅ فیش شما دریافت شد و برای مالک ارسال شد. بعد از تایید، اطلاع می‌دهیم."
-    if not res.get("chat_id"):
+    if not res.get("chat_id") and res_kind(res) == "bot":
+        text += "\n\nحالا <b>یوزرنیم ربات</b> خود را بفرستید (مثال: <code>@MyBot</code>) تا به رزرو شما متصل شود."
+        await reply(update, text, reply_markup=buyer_menu_kb())
+    elif not res.get("chat_id"):
         text += (
             "\n\nدر همین فاصله، ربات را با دکمه‌های زیر ادمین گروه/کانال خودتان کنید "
             "تا خودکار شناسایی و به رزرو شما متصل شود."
@@ -1023,6 +1147,15 @@ async def buyer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     step = state.get("step")
+    if step == "type":
+        kinds = available_kinds()
+        if text == BTN_TYPE_CHAT and "chat" in kinds:
+            await _show_days(update, "chat")
+        elif text == BTN_TYPE_BOT and "bot" in kinds:
+            await _show_days(update, "bot")
+        else:
+            await _show_types(update)
+        return
     if step == "days":
         await _pick_day(update, state, text)
         return
@@ -1032,9 +1165,15 @@ async def buyer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     hold = open_hold(user.id)
 
-    if text and looks_like_chat_ref(text) and find_unbound(user.id) is not None:
-        if await _try_bind_by_ref(update, context, text):
+    if text:
+        bot_res = find_unbound(user.id, "bot")
+        bot_name = extract_bot_username(text) if bot_res is not None else None
+        if bot_res is not None and bot_name:
+            await bind_bot_username(context.bot, bot_res, bot_name)
             return
+        if looks_like_chat_ref(text) and find_unbound(user.id, "chat") is not None:
+            if await _try_bind_by_ref(update, context, text):
+                return
 
     if hold is not None and (step == "receipt" or message.photo or message.document):
         await _receive_receipt(update, context, hold)
@@ -1134,6 +1273,14 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"به‌صورت خودکار وارد جوین اجباری می‌شود."
         )
         await safe_send(context.bot, buyer_id, text, reply_markup=buyer_menu_kb())
+    elif res_kind(res) == "bot":
+        await safe_send(
+            context.bot,
+            buyer_id,
+            "✅ <b>فیش شما تایید شد.</b>\nحالا <b>یوزرنیم ربات</b> خود را بفرستید (مثال: <code>@MyBot</code>) "
+            f"تا به رزرو {fa_day_full(res['day'])} شما متصل شود.",
+            reply_markup=buyer_menu_kb(),
+        )
     else:
         text = (
             f"✅ <b>فیش شما تایید شد.</b>\n"
@@ -1161,7 +1308,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     if cmu.chat.id == await core.get_group_id():
         return
-    res = find_unbound(adder.id)
+    res = find_unbound(adder.id, "chat")
     if res is None:
         return
     chat = cmu.chat
@@ -1218,43 +1365,50 @@ async def _activate(bot, res: dict) -> None:
         return
     _ACTIVATING.add(rid)
     try:
-        chat_id = int(res["chat_id"])
-        admin_states = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
-        try:
-            me = await bot.get_chat_member(chat_id, bot.id)
-            chat = await bot.get_chat(chat_id)
-        except (BadRequest, Forbidden) as exc:
-            await _activation_failed(bot, res, f"دسترسی ربات به گروه/کانال ممکن نیست ({exc}). ربات را دوباره ادمین کنید.")
-            return
-        if me.status not in admin_states:
-            await _activation_failed(bot, res, "ربات دیگر ادمین این گروه/کانال نیست.")
-            return
+        chat_key = str(res["chat_id"])
 
-        existing = await core.get_item_by_chat_id(str(chat_id))
+        existing = await core.get_item_by_chat_id(chat_key)
         if existing is not None and not core.item_is_expired(existing):
-            await _activation_failed(bot, res, "این گروه/کانال هم‌اکنون در لیست جوین اجباری فعال است؛ بعد از پایان آن شروع می‌شود.")
+            await _activation_failed(bot, res, "این مورد هم‌اکنون در لیست جوین اجباری فعال است؛ بعد از پایان آن شروع می‌شود.")
             return
 
-        link = f"https://t.me/{chat.username}" if chat.username else chat.invite_link
-        if not link:
+        if res_kind(res) == "bot":
+            kind = "bot"
+            title = res.get("chat_title") or chat_key
+            link = f"https://t.me/{chat_key}?start=verify_join"
+            baseline = await core.count_bot_starts(chat_key)
+        else:
+            chat_id = int(chat_key)
+            admin_states = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
             try:
-                link = await bot.export_chat_invite_link(chat_id)
+                me = await bot.get_chat_member(chat_id, bot.id)
+                chat = await bot.get_chat(chat_id)
             except (BadRequest, Forbidden) as exc:
-                await _activation_failed(bot, res, f"ساخت لینک دعوت ممکن نشد؛ دسترسی «دعوت کاربران» را به ربات بدهید ({exc}).")
+                await _activation_failed(bot, res, f"دسترسی ربات به گروه/کانال ممکن نیست ({exc}). ربات را دوباره ادمین کنید.")
                 return
-
-        try:
-            baseline = await bot.get_chat_member_count(chat_id)
-        except (BadRequest, Forbidden, TimedOut, NetworkError):
-            baseline = None
+            if me.status not in admin_states:
+                await _activation_failed(bot, res, "ربات دیگر ادمین این گروه/کانال نیست.")
+                return
+            kind = "channel" if chat.type == Chat.CHANNEL else "group"
+            title = chat.title or res.get("chat_title") or chat_key
+            link = f"https://t.me/{chat.username}" if chat.username else chat.invite_link
+            if not link:
+                try:
+                    link = await bot.export_chat_invite_link(chat_id)
+                except (BadRequest, Forbidden) as exc:
+                    await _activation_failed(bot, res, f"ساخت لینک دعوت ممکن نشد؛ دسترسی «دعوت کاربران» را به ربات بدهید ({exc}).")
+                    return
+            try:
+                baseline = await bot.get_chat_member_count(chat_id)
+            except (BadRequest, Forbidden, TimedOut, NetworkError):
+                baseline = None
 
         now = utcnow()
         expires = now + timedelta(hours=res["hours"])
-        kind = "channel" if chat.type == Chat.CHANNEL else "group"
         payload = {
             "kind": kind,
-            "chat_id": str(chat_id),
-            "title": chat.title or res.get("chat_title") or str(chat_id),
+            "chat_id": chat_key,
+            "title": title,
             "invite_link": link,
             "expires_at": expires.isoformat(),
             "start_members": baseline,
@@ -1271,14 +1425,14 @@ async def _activate(bot, res: dict) -> None:
             return
         core._cache_clear()
         core._member_count_cache.clear()
-        item = await core.get_item_by_chat_id(str(chat_id))
+        item = await core.get_item_by_chat_id(chat_key)
         core._attr_count_cache.pop(item["id"] if item else None, None)
 
         set_status(
             res, "active",
             item_id=item["id"] if item else None,
-            chat_kind=kind,
-            chat_title=payload["title"],
+            chat_kind="bot" if kind == "bot" else kind,
+            chat_title=title,
             activated_at=iso(now),
             expires_at=iso(expires),
         )
@@ -1288,13 +1442,13 @@ async def _activate(bot, res: dict) -> None:
         await safe_send(
             bot,
             res["user_id"],
-            f"🟢 <b>جوین اجباری «{e(payload['title'])}» فعال شد.</b>\n"
+            f"🟢 <b>جوین اجباری «{e(title)}» فعال شد.</b>\n"
             f"⏱ مدت: {fmt_hours(res['hours'])}\n🕓 پایان: {fa_datetime(expires)}\n\n"
             "بعد از پایان، عکس قبل و بعد را برایتان می‌فرستم.",
         )
         await notify_admins(
             bot,
-            f"🟢 جوین فروخته‌شده فعال شد: «{e(payload['title'])}» — {user_label(res['user_id'])} "
+            f"🟢 جوین فروخته‌شده فعال شد: «{e(title)}» — {user_label(res['user_id'])} "
             f"({fmt_hours(res['hours'])}، تا {fa_datetime(expires)})",
         )
     except Exception as exc:  # noqa: BLE001
@@ -1401,16 +1555,22 @@ def _cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data="sale_cfg_cancel", style="danger")]])
 
 
+def _tariff_lines(title: str, tariffs: list) -> list:
+    if not tariffs:
+        return []
+    return [f"\n<b>{title}:</b>"] + [f"• {fmt_hours(t['hours'])} = {fmt_money(t['price'])}" for t in tariffs]
+
+
 def sale_panel_text(schema_err: Optional[str] = None) -> str:
     lines = ["💰 <b>فروش جوین اجباری خودکار</b>", ""]
     lines.append(f"وضعیت: {'🟢 روشن' if CFG['enabled'] else '🔴 خاموش'}")
-    if CFG["tariffs"]:
-        lines.append("\n<b>تعرفه‌ها:</b>")
-        lines += [f"• {fmt_hours(t['hours'])} = {fmt_money(t['price'])}" for t in CFG["tariffs"]]
+    lines += _tariff_lines("تعرفه‌ی کانال و گروه", CFG["tariffs"])
+    lines += _tariff_lines("تعرفه‌ی ربات", CFG["bot_tariffs"])
     if CFG["card_number"]:
         lines.append(f"\n💳 <code>{fmt_card(CFG['card_number'])}</code> — {e(CFG['card_name'])}")
     if CFG["lanes"]:
         lines.append(f"🛣 لاین در هر ۲۴ ساعت: {to_fa(CFG['lanes'])}")
+        lines.append("ℹ️ آیتم‌هایی که خودتان دستی اضافه می‌کنید هم از همین لاین‌ها کم می‌شود (ولی دستی همیشه قابل افزودن است).")
     if not config_complete():
         lines.append("\n⚠️ برای شروع فروش، ابتدا «تنظیم تعرفه» را کامل کنید.")
     if schema_err:
@@ -1438,8 +1598,9 @@ def sale_panel_kb() -> InlineKeyboardMarkup:
 
 
 def _summary_text(draft: dict) -> str:
-    lines = ["📝 <b>خلاصه‌ی تنظیمات فروش</b>", "", "<b>تعرفه‌ها:</b>"]
-    lines += [f"• {fmt_hours(t['hours'])} = {fmt_money(t['price'])}" for t in draft["tariffs"]]
+    lines = ["📝 <b>خلاصه‌ی تنظیمات فروش</b>"]
+    lines += _tariff_lines("تعرفه‌ی کانال و گروه", draft["tariffs"]) or ["\nتعرفه‌ی کانال و گروه: ندارد"]
+    lines += _tariff_lines("تعرفه‌ی ربات", draft["bot_tariffs"]) or ["\nتعرفه‌ی ربات: ندارد"]
     lines.append(f"\n💳 <code>{fmt_card(draft['card_number'])}</code>\n👤 {e(draft['card_name'])}")
     lines.append(f"🛣 لاین در هر ۲۴ ساعت: {to_fa(draft['lanes'])}")
     lines.append("\nبرای ذخیره روی «ثبت» بزنید.")
@@ -1447,18 +1608,28 @@ def _summary_text(draft: dict) -> str:
 
 
 TARIFF_PROMPT = (
-    "💰 <b>تنظیم تعرفه</b>\n\n"
-    "تعرفه‌ها را بفرستید؛ هر خط یک تعرفه، به این شکل:\n"
+    "💰 <b>تنظیم تعرفه — مرحله ۱ از ۴</b>\n\n"
+    "اول تعرفه‌ی <b>کانال و گروه</b> را بفرستید؛ هر خط یک تعرفه، به این شکل:\n"
     "<code>ساعت = مبلغ به تومان</code>\n\n"
-    "مثال:\n<code>12 = 250000\n48 = 500000</code>\n\n"
-    "(ساعت و مبلغ هر چیزی که بخواهید.)"
+    "مثال:\n<code>12 = 25000\n48 = 50000</code>\n\n"
+    "(ساعت و مبلغ هر چیزی که بخواهید.) اگر کانال/گروه نمی‌فروشید فقط <code>-</code> بفرستید."
+)
+BOT_TARIFF_PROMPT = (
+    "🤖 <b>تنظیم تعرفه — مرحله ۲ از ۴</b>\n\n"
+    "حالا تعرفه‌ی ساعتیِ <b>ربات</b> را با همان فرمت بفرستید:\n"
+    "<code>12 = 15000\n48 = 30000</code>\n\n"
+    "اگر ربات نمی‌فروشید فقط <code>-</code> بفرستید."
 )
 CARD_PROMPT = (
-    "💳 حالا <b>شماره کارت</b> را همراه با <b>نام و نام خانوادگی</b> صاحب کارت بفرستید.\n\n"
+    "💳 <b>مرحله ۳ از ۴</b>\n\n"
+    "<b>شماره کارت</b> را همراه با <b>نام و نام خانوادگی</b> صاحب کارت بفرستید.\n\n"
     "مثال:\n<code>6037991234567890\nعلی رضایی</code>"
 )
 LANES_PROMPT = (
-    "🛣 <b>تعداد لاین هر ۲۴ ساعت</b> را بفرستید؛ یعنی در یک روز چند کانال/گروه می‌توانند وارد جوین اجباری شوند.\n\n"
+    "🛣 <b>مرحله ۴ از ۴ — تعداد لاین هر ۲۴ ساعت</b>\n\n"
+    "یعنی در یک روز چند کانال/گروه/ربات می‌توانند وارد جوین اجباری شوند.\n"
+    "اگر مثلاً ۳ لاین بگذارید و خودتان ۲ تا را دستی اضافه کرده باشید، آن روز فقط ۱ فروش خودکار ممکن است؛ "
+    "وقتی لاین‌ها (دستی یا خودکار) پر شوند، آن روز برای خریدار قرمز می‌شود ولی شما همچنان می‌توانید دستی اضافه کنید.\n\n"
     "مثال: <code>3</code>"
 )
 
@@ -1527,10 +1698,11 @@ async def sale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         draft = state["draft"]
         CFG_STATE.pop(user_id, None)
         CFG["tariffs"] = draft["tariffs"]
+        CFG["bot_tariffs"] = draft["bot_tariffs"]
         CFG["card_number"] = draft["card_number"]
         CFG["card_name"] = draft["card_name"]
         CFG["lanes"] = draft["lanes"]
-        errors = await persist_config("tariffs", "card", "lanes")
+        errors = await persist_config("tariffs", "bot_tariffs", "card", "lanes")
         if errors:
             await show(
                 f"❌ ذخیره در دیتابیس ناموفق بود (تا ری‌استارت سرور اعمال می‌ماند):\n<code>{e(errors[0][:200])}</code>",
@@ -1548,13 +1720,17 @@ async def sale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         lines = ["📅 <b>رزروهای باز</b>", ""]
         for r in rows[:25]:
             lines.append(
-                f"• {fa_day_full(r['day'])} — {fmt_hours(r['hours'])} — {user_label(r['user_id'])}\n"
+                f"• {TYPE_LABEL[res_kind(r)]} — {fa_day_full(r['day'])} — {fmt_hours(r['hours'])} — {user_label(r['user_id'])}\n"
                 f"   {STATUS_LABEL.get(r['status'], r['status'])}"
                 + (f" — {e(r['chat_title'])}" if r.get("chat_title") else "")
             )
         if len(rows) > 25:
             lines.append(f"\nو {len(rows) - 25} مورد دیگر…")
         await show("\n".join(lines), InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="sale_open")]]))
+
+
+def _is_skip(text: str) -> bool:
+    return (text or "").strip() in SKIP_WORDS
 
 
 async def admin_sale_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1567,18 +1743,36 @@ async def admin_sale_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text = (message.text or "").strip()
     step = state["step"]
 
-    if step == "tariffs":
-        tariffs, bad = parse_tariffs(text)
-        if bad or not tariffs:
-            detail = "\n".join(f"• <code>{e(b)}</code>" for b in bad[:8]) if bad else ""
+    if step in ("tariffs", "bot_tariffs"):
+        if _is_skip(text):
+            tariffs, bad = [], []
+        else:
+            tariffs, bad = parse_tariffs(text)
+            if not tariffs and not bad:
+                bad = ["(خالی)"]
+        if bad:
+            detail = "\n".join(f"• <code>{e(b)}</code>" for b in bad[:8])
             await reply(
                 update,
-                "❌ فرمت تعرفه درست نیست." + (f"\n\nخطوط نامعتبر:\n{detail}" if detail else "") +
-                "\n\nهر خط باید مثل <code>12 = 250000</code> باشد. دوباره بفرستید.",
+                "❌ فرمت تعرفه درست نیست.\n\nخطوط نامعتبر:\n" + detail +
+                "\n\nهر خط باید مثل <code>12 = 25000</code> باشد (یا <code>-</code> برای «ندارم»). دوباره بفرستید.",
                 reply_markup=_cancel_kb(),
             )
             return True
-        state["draft"] = {"tariffs": tariffs}
+        if step == "tariffs":
+            state["draft"] = {"tariffs": tariffs}
+            state["step"] = "bot_tariffs"
+            await reply(update, BOT_TARIFF_PROMPT, reply_markup=_cancel_kb())
+            return True
+        state["draft"]["bot_tariffs"] = tariffs
+        if not state["draft"]["tariffs"] and not tariffs:
+            state["step"] = "tariffs"
+            await reply(
+                update,
+                "❌ حداقل یکی از دو تعرفه (کانال/گروه یا ربات) باید ثبت شود. از اول شروع می‌کنیم.\n\n" + TARIFF_PROMPT,
+                reply_markup=_cancel_kb(),
+            )
+            return True
         state["step"] = "card"
         await reply(update, CARD_PROMPT, reply_markup=_cancel_kb())
         return True
